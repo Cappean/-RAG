@@ -1,259 +1,255 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import {
-  Bell, BookOpen, Camera, Check, CheckCircle2, ChevronDown,
-  ClipboardList, FilePlus2, FileText, HeartPulse, History, Menu, Mic,
-  Plus, Search, Send, Settings2, ShieldCheck, Stethoscope, Tag, UserRound,
-  X, Zap,
-} from 'lucide-vue-next'
-import { createConversation, fetchConversationContent, fetchConversations, submitSupplement, type Citation, type Conversation, type ConversationContent, type ConversationExchange } from './api'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { BookOpen, ChevronLeft, ChevronRight, History, Plus, Send, ShieldCheck, Stethoscope, Upload } from 'lucide-vue-next'
+import SourceViewer from './SourceViewer.vue'
+import { jsonBody, requestJson, streamMessage, type Citation, type Conversation, type KnowledgeDocument, type Message, type Patient, type PatientInput, type TaskState, type UploadResult } from './api'
 
+const patients = ref<Patient[]>([])
 const conversations = ref<Conversation[]>([])
-const activeConversationId = ref('c-1')
-const activeContent = ref<ConversationContent | null>(null)
-const exchanges = ref<ConversationExchange[]>([])
+const documents = ref<KnowledgeDocument[]>([])
+const messages = ref<Message[]>([])
+const patientId = ref('')
+const activeConversationId = ref('')
 const inputText = ref('')
-const selectedFile = ref<File | null>(null)
-const busy = ref(false)
-const streamedReply = ref('')
-const streamStatus = ref('')
+const error = ref('')
 const notice = ref('')
+const busy = ref(false)
+const loading = ref(false)
+const creatingConversation = ref(false)
+const streamStatus = ref('')
+const uploadBusy = ref(false)
 const viewerCitation = ref<Citation | null>(null)
-const showAllHistory = ref(false)
-const currentPatient = ref('林晨（本人）')
-const newConversation = async () => {
-  try {
-    const conversation = await createConversation()
-    conversations.value.unshift({ ...conversation, active: true })
-    activeConversationId.value = conversation.id
-  } catch {
-    notice.value = '创建会话失败，请稍后重试'
-    window.setTimeout(() => { notice.value = '' }, 2600)
-    return
-  }
-  activeContent.value = null
-  exchanges.value = []
-  conversations.value.forEach((item) => { item.active = item.id === activeConversationId.value })
-  notice.value = '已创建新的问诊会话'
-  window.setTimeout(() => { notice.value = '' }, 2200)
+const showPatientForm = ref(false)
+const editingPatientId = ref('')
+const patientBusy = ref(false)
+const patientForm = reactive({ name: '', gender: '', birthDate: '', allergies: '', medicalHistory: '', medications: '' })
+const taskStates = reactive<Record<string, TaskState>>({})
+const polling = new Set<string>()
+const currentPath = ref(window.location.pathname)
+const sidebarCollapsed = ref(localStorage.getItem('medical.demo.sidebar-collapsed') === 'true')
+let disposed = false
+let controller: AbortController | null = null
+let selectionVersion = 0
+let pollTimer: ReturnType<typeof setTimeout> | undefined
+
+const currentPatient = computed(() => patients.value.find(patient => patient.id === patientId.value))
+const readyDocuments = computed(() => documents.value.filter(document => document.status === 'ready'))
+const selectedConversation = computed(() => conversations.value.find(conversation => conversation.id === activeConversationId.value))
+const labelStatus = (status: string) => ({ processing: '处理中', ready: '可检索', failed: '失败', disabled: '已停用', queued: '排队中', running: '运行中', succeeded: '完成' }[status] ?? status)
+const timeLabel = (value: string) => new Date(value).toLocaleString('zh-CN')
+const showError = (exc: unknown) => { error.value = exc instanceof Error ? exc.message : '请求失败，请检查服务连接' }
+
+/** Lists are fetched in full; UI counts always derive from real server records. */
+async function refreshLists() {
+  const [newPatients, newConversations, newDocuments] = await Promise.all([
+    requestJson<Patient[]>('/api/patients'), requestJson<Conversation[]>('/api/conversations'), requestJson<KnowledgeDocument[]>('/api/knowledge/documents'),
+  ])
+  patients.value = newPatients
+  conversations.value = newConversations
+  documents.value = newDocuments
 }
-const selectConversation = (conversation: Conversation) => {
+
+async function initialize() {
+  loading.value = true
+  error.value = ''
+  try {
+    await refreshLists()
+    const savedConversation = localStorage.getItem('medical.demo.conversation')
+    const previous = conversations.value.find(item => item.id === savedConversation)
+    if (previous) await selectConversation(previous)
+    else patientId.value = patients.value.find(item => item.id === localStorage.getItem('medical.demo.patient'))?.id ?? ''
+    schedulePoll()
+  } catch (exc) { showError(exc) }
+  finally { loading.value = false }
+}
+
+async function selectConversation(conversation: Conversation) {
+  if (busy.value) return
+  const version = ++selectionVersion
   activeConversationId.value = conversation.id
-  void loadConversation(conversation.id)
-  conversations.value.forEach((item) => { item.active = item.id === conversation.id })
-}
-const loadConversation = async (id: string) => {
-  activeContent.value = await fetchConversationContent(id)
-  exchanges.value = []
-}
-const visibleConversations = computed(() => showAllHistory.value ? conversations.value : conversations.value.slice(0, 3))
-
-onMounted(async () => {
-  conversations.value = await fetchConversations()
-  if (!conversations.value.some((item) => item.id === activeConversationId.value)) {
-    activeConversationId.value = conversations.value[0]?.id ?? ''
-  }
-  await loadConversation(activeConversationId.value)
-})
-
-const attachFile = (event: Event) => {
-  const target = event.target as HTMLInputElement
-  selectedFile.value = target.files?.[0] ?? null
-}
-const removeFile = () => { selectedFile.value = null }
-const sendSupplement = async () => {
-  if ((!inputText.value.trim() && !selectedFile.value) || busy.value) return
-  busy.value = true
-  streamedReply.value = ''
-  streamStatus.value = ''
-  const userText = inputText.value.trim()
-  const file = selectedFile.value
+  patientId.value = conversation.patientId ?? ''
+  localStorage.setItem('medical.demo.conversation', conversation.id)
+  messages.value = []
+  loading.value = true
+  error.value = ''
   try {
-    const result = await submitSupplement(activeConversationId.value, userText, file, {
-      onToken: (token) => { streamedReply.value += token },
-      onStatus: (status) => { streamStatus.value = status },
-    })
-    if (result.citations.length && activeContent.value) {
-      activeContent.value.citations = result.citations
-      activeContent.value.evidenceTitle = `RAG多源循证检索完成（命中 ${result.citations.length} 份核心指南）`
-    }
-    if (!activeContent.value) {
-      activeContent.value = {
-        question: userText || `请查看我上传的资料：${file?.name ?? ''}`,
-        sentAt: `刚刚 ${result.generatedAt}`,
-        entities: [],
-        evidenceTitle: '本轮 mock 问诊暂未关联指南来源',
-        citations: [],
-        analysisTitle: '智能分析',
-        analysis: result.message,
-        recommendation: '请结合实际症状，必要时咨询医生',
+    const history = await requestJson<Message[]>(`/api/conversations/${conversation.id}/messages`)
+    if (version === selectionVersion) messages.value = history
+  } catch (exc) { if (version === selectionVersion) showError(exc) }
+  finally { if (version === selectionVersion) loading.value = false }
+}
+
+function selectPatient() {
+  // Changing the consultation subject never silently reassigns an existing conversation.
+  activeConversationId.value = ''
+  messages.value = []
+  localStorage.removeItem('medical.demo.conversation')
+  localStorage.setItem('medical.demo.patient', patientId.value)
+}
+
+async function newConversation() {
+  if (!patientId.value || busy.value || creatingConversation.value) return
+  creatingConversation.value = true
+  error.value = ''
+  try {
+    const conversation = await requestJson<Conversation>('/api/conversations', jsonBody({ patientId: patientId.value, title: '新问诊' }))
+    conversations.value.unshift(conversation)
+    await selectConversation(conversation)
+  } catch (exc) { showError(exc) }
+  finally { creatingConversation.value = false }
+}
+
+function openPatientForm(edit = false) {
+  const patient = edit ? currentPatient.value : undefined
+  editingPatientId.value = patient?.id ?? ''
+  Object.assign(patientForm, { name: patient?.name ?? '', gender: patient?.gender ?? '', birthDate: patient?.birthDate?.slice(0, 10) ?? '', allergies: patient?.allergies.join('\n') ?? '', medicalHistory: patient?.medicalHistory.join('\n') ?? '', medications: patient?.medications.join('\n') ?? '' })
+  showPatientForm.value = true
+}
+
+async function savePatient() {
+  patientBusy.value = true
+  error.value = ''
+  const entries = (text: string) => text.split('\n').map(item => item.trim()).filter(Boolean)
+  const payload: PatientInput = { name: patientForm.name.trim(), gender: patientForm.gender || null, birthDate: patientForm.birthDate || null, allergies: entries(patientForm.allergies), medicalHistory: entries(patientForm.medicalHistory), medications: entries(patientForm.medications) }
+  try {
+    const patient = await requestJson<Patient>(editingPatientId.value ? `/api/patients/${editingPatientId.value}` : '/api/patients', jsonBody(payload, editingPatientId.value ? 'PUT' : 'POST'))
+    patients.value = await requestJson<Patient[]>('/api/patients')
+    if (!editingPatientId.value) { patientId.value = patient.id; selectPatient() }
+    showPatientForm.value = false
+    notice.value = '患者档案已保存'
+  } catch (exc) { showError(exc) }
+  finally { patientBusy.value = false }
+}
+
+async function sendMessage() {
+  if (busy.value || creatingConversation.value || !inputText.value.trim() || !patientId.value || !readyDocuments.value.length) return
+  if (!activeConversationId.value) await newConversation()
+  if (!activeConversationId.value) return
+  busy.value = true
+  error.value = ''
+  streamStatus.value = '正在连接问诊服务…'
+  controller = new AbortController()
+  const content = inputText.value.trim()
+  try {
+    await streamMessage(activeConversationId.value, content, ({ type, data }) => {
+      if (type === 'assistant_created') {
+        messages.value.push(data.userMessage as Message, data.message as Message)
+        inputText.value = ''
+      } else if (type === 'status') streamStatus.value = String(data.stage ?? '正在处理')
+      else if (type === 'token') {
+        const message = messages.value.find(item => item.id === data.messageId)
+        if (message) message.content += String(data.delta ?? '')
+      } else if (type === 'citations') {
+        const message = messages.value.find(item => item.id === data.messageId)
+        if (message) message.citations = data.citations as Citation[]
+      } else if (type === 'done') {
+        const completed = data.message as Message
+        const index = messages.value.findIndex(item => item.id === completed.id)
+        if (index >= 0) messages.value[index] = completed
+        notice.value = data.retrievalMs != null ? `本轮检索 ${Number(data.retrievalMs).toFixed(0)} ms` : '回答已保存'
       }
-      const conversation = conversations.value.find((item) => item.id === activeConversationId.value)
-      if (conversation) {
-        conversation.title = (userText || `上传资料：${file?.name ?? ''}`).slice(0, 24)
-        conversation.preview = result.message.slice(0, 34)
-      }
-    } else {
-      exchanges.value.push({
-        id: `exchange-${Date.now()}`,
-        userText: userText || '上传了一份资料',
-        fileName: file?.name,
-        assistantText: result.message,
-        sentAt: result.generatedAt,
-      })
-    }
-    inputText.value = ''
-    selectedFile.value = null
-    notice.value = `补充已发送 · ${result.generatedAt}`
-    window.setTimeout(() => { notice.value = '' }, 2600)
-  } catch {
-    notice.value = '发送失败，请稍后重试'
-    window.setTimeout(() => { notice.value = '' }, 2600)
-  } finally {
+    }, controller.signal)
+  } catch (exc) { showError(exc) }
+  finally {
     busy.value = false
-    streamedReply.value = ''
     streamStatus.value = ''
+    controller = null
+    // Reconcile persisted state after completion, disconnect or server-side failure.
+    if (!disposed) {
+      try { messages.value = await requestJson<Message[]>(`/api/conversations/${activeConversationId.value}/messages`) }
+      catch (exc) { showError(exc) }
+    }
+    if (!disposed) {
+      try { conversations.value = await requestJson<Conversation[]>('/api/conversations') }
+      catch (exc) { showError(exc) }
+    }
   }
 }
-const openCitation = (citation: Citation) => { viewerCitation.value = citation }
+
+function rememberTask(result: UploadResult) {
+  documents.value = [result.document, ...documents.value.filter(document => document.id !== result.document.id)]
+  if (result.taskId) polling.add(result.taskId)
+  notice.value = result.duplicate ? '文件已存在，已返回真实文档状态' : '文件已接收，等待入库完成'
+  schedulePoll()
+}
+
+async function upload(event: Event) {
+  const target = event.target as HTMLInputElement
+  const file = target.files?.[0]
+  if (!file) return
+  uploadBusy.value = true
+  error.value = ''
+  const form = new FormData()
+  form.set('file', file)
+  try { rememberTask(await requestJson<UploadResult>('/api/knowledge/documents', { method: 'POST', body: form })) }
+  catch (exc) { showError(exc) }
+  finally { uploadBusy.value = false; target.value = '' }
+}
+async function retry(document: KnowledgeDocument) {
+  error.value = ''
+  try { rememberTask(await requestJson<UploadResult>(`/api/knowledge/documents/${document.id}/retry`, { method: 'POST' })) }
+  catch (exc) { showError(exc) }
+}
+
+function schedulePoll() {
+  if (pollTimer || disposed) return
+  pollTimer = setTimeout(() => { pollTimer = undefined; void poll() }, 1500)
+}
+async function poll() {
+  try {
+    for (const taskId of [...polling]) {
+      try {
+        const task = await requestJson<TaskState>(`/api/tasks/${taskId}`)
+        taskStates[taskId] = task
+        if (task.status === 'succeeded' || task.status === 'failed') polling.delete(taskId)
+      } catch (exc) { polling.delete(taskId); showError(exc) }
+    }
+    if (documents.value.some(document => document.status === 'processing') || Object.keys(taskStates).length) documents.value = await requestJson<KnowledgeDocument[]>('/api/knowledge/documents')
+  } catch (exc) { showError(exc) }
+  if (polling.size || documents.value.some(document => document.status === 'processing')) schedulePoll()
+}
+
+onMounted(initialize)
+function syncPath() { currentPath.value = window.location.pathname }
+onMounted(() => window.addEventListener('popstate', syncPath))
+onBeforeUnmount(() => { disposed = true; controller?.abort(); clearTimeout(pollTimer) })
+onBeforeUnmount(() => window.removeEventListener('popstate', syncPath))
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  localStorage.setItem('medical.demo.sidebar-collapsed', String(sidebarCollapsed.value))
+}
 </script>
 
 <template>
   <div class="app-shell">
-    <header class="topbar">
-      <div class="brand-block">
-        <div class="brand-icon"><Plus :size="18" :stroke-width="3" /></div>
-        <div class="brand-copy">
-          <div class="brand-title">智医问康 <span>RAG临床决策</span></div>
-          <div class="brand-subtitle">国家卫健委 / 中华医学会指南增强</div>
-        </div>
-      </div>
-      <div class="top-actions">
-        <div class="online-pill"><i></i> RAG知识库 · 在线</div>
-        <button class="search-button" type="button"><Search :size="15" /> 搜索疾病、症状或药品...</button>
-        <button class="icon-button notification" title="通知"><Bell :size="18" /><i></i></button>
-        <button class="profile-button" title="个人中心"><UserRound :size="18" /></button>
-      </div>
-    </header>
-
-    <div class="engine-bar">
-      <span class="status-switch"><i></i></span>
-      <span class="engine-dot"><Settings2 :size="14" /></span>
-      <span>医学多模态向量嵌入引擎：<b>v4.2.0-MedPro</b></span>
-      <div class="latency"><Zap :size="15" /> RAG检索延迟：<b>180ms</b><span></span><span></span></div>
-    </div>
-
-    <div class="workspace">
+    <header class="topbar"><div class="brand-block"><div class="brand-icon"><Plus :size="18" /></div><div class="brand-copy"><div class="brand-title">智医问康 <span>循证问诊 Demo</span></div><div class="brand-subtitle">真实知识检索 · 多轮问诊 · 来源追溯</div></div></div><div class="top-actions"><span class="demo-label">本地演示环境 · 暂无身份认证</span><button class="secondary-button" :disabled="busy || loading" @click="initialize">刷新数据</button></div></header>
+    <div class="engine-bar"><ShieldCheck :size="16" /><span>BGE-M3 CPU · 稠密与稀疏检索 · 暂不使用重排</span><span class="latency">知识文档可检索 {{ readyDocuments.length }} / {{ documents.length }}</span></div>
+    <div v-if="error" role="alert" class="global-error">{{ error }}<button @click="error = ''">关闭</button></div>
+    <div v-if="notice" role="status" class="global-notice">{{ notice }}</div>
+    <nav class="page-nav"><a href="/" :aria-current="currentPath === '/' ? 'page' : undefined">智能问诊</a><a href="/import" :aria-current="currentPath === '/import' ? 'page' : undefined"><Upload :size="15" />文档入库</a></nav>
+    <main v-if="currentPath === '/import'" class="import-page">
+      <section class="surface import-heading"><div><BookOpen :size="20" /><div><h1>知识文档入库</h1><p class="muted">仅上传作为公共知识来源的文件；问诊报告附件暂未启用。</p></div></div><label class="upload-button">{{ uploadBusy ? '正在上传…' : '上传 PDF / Markdown' }}<input type="file" accept=".pdf,.md,.markdown" :disabled="uploadBusy" @change="upload" /></label></section>
+      <section class="import-list"><div class="import-list-heading"><h2>入库文档</h2><span class="muted">{{ readyDocuments.length }} / {{ documents.length }} 可检索</span></div><div v-if="!documents.length" class="import-empty surface"><BookOpen :size="22" /><p>还没有入库文档</p></div><article v-for="document in documents" :key="document.id" class="surface import-document"><div class="import-document-main"><BookOpen :size="18" /><div><strong>{{ document.name }}</strong><small>{{ document.sourceType.toUpperCase() }} · {{ labelStatus(document.status) }}</small></div></div><span :class="`doc-status ${document.status}`">{{ labelStatus(document.status) }}</span><button v-if="document.status === 'failed'" class="text-button" @click="retry(document)">重新提交入库</button><button class="text-button" @click="viewerCitation = { chunkId: '', documentId: document.id, documentName: document.name, quote: '', headingPath: [], sourceLocations: [] }">查看原文</button></article><p v-for="task in taskStates" :key="task.taskId" class="task-line">任务 {{ task.taskId.slice(0, 8) }}：{{ labelStatus(task.status) }} {{ task.progress || '' }}<span v-if="task.error" class="failure-text"> · {{ task.error }}</span></p></section>
+    </main>
+    <div v-else class="workspace" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
       <aside class="sidebar">
-        <button class="new-consult" type="button" @click="newConversation"><Plus :size="19" /> 新建智能问诊</button>
-
-        <section class="patient-panel">
-          <div class="panel-heading"><span>当前咨询对象</span><button type="button" @click="currentPatient = currentPatient.includes('林晨') ? '林母（家属）' : '林晨（本人）'">切换档案</button></div>
-          <div class="patient-info">
-            <div class="patient-avatar">林</div>
-            <div><strong>{{ currentPatient }}</strong><span>男 · 34岁 · 无药物过敏史</span></div>
-            <ChevronDown class="patient-chevron" :size="15" />
-          </div>
-        </section>
-
-        <section class="history-panel">
-          <div class="history-heading"><div><History :size="17" /> <span>历史咨询记录</span></div><span class="count-pill">共 14 条</span></div>
-          <div class="history-list">
-            <button v-for="conversation in visibleConversations" :key="conversation.id" class="history-item" :class="{ selected: conversation.id === activeConversationId }" type="button" @click="selectConversation(conversation)">
-              <div class="history-meta"><span>{{ conversation.timeLabel }}</span></div>
-              <strong>{{ conversation.title }}</strong>
-              <small>{{ conversation.preview }}</small>
-            </button>
-          </div>
-          <button class="more-history" type="button" @click="showAllHistory = !showAllHistory">{{ showAllHistory ? '收起历史会话' : '查看更多历史会话 (10+)' }}</button>
-        </section>
-
-        <section class="database-panel">
-          <div class="database-title"><ShieldCheck :size="17" /> 当前挂载医学证据库</div>
-          <ul>
-            <li>中华医学会消化病学分会指南库</li>
-            <li>国家消化系统疾病临床医学中心指导</li>
-            <li>国家基本药物临床应用指南 (2023)</li>
-          </ul>
-        </section>
-      </aside>
-
-      <main class="main-content">
-        <section v-if="!activeContent" class="empty-consult surface">
-          <div class="empty-icon"><Stethoscope :size="24" /></div>
-          <h2>开始新的智能问诊</h2>
-          <p>请在下方描述症状、持续时间和相关病史，或上传检查报告。</p>
-          <div class="empty-prompts"><span>症状从什么时候开始？</span><span>什么情况会加重或缓解？</span><span>目前是否正在用药？</span></div>
-        </section>
-        <template v-else>
-        <section class="question-card surface">
-          <div class="patient-message-heading"><div class="patient-avatar small">患</div><strong>患者&nbsp; {{ currentPatient.split('（')[0] }}</strong><span>{{ activeContent.sentAt }} 发送</span></div>
-          <div class="question-bubble">“{{ activeContent.question }}”</div>
-          <div class="entity-row"><Tag :size="15" /><span>识别实体：</span><span v-for="entity in activeContent.entities" :key="entity" class="entity-chip">{{ entity }}</span></div>
-        </section>
-
-        <section class="evidence-section">
-          <div class="section-title"><span class="search-mark"><Search :size="14" /></span><strong>{{ activeContent.evidenceTitle }}</strong></div>
-          <button v-for="citation in activeContent.citations" :key="citation.id" class="evidence-card" type="button" @click="openCitation(citation)">
-            <div class="evidence-head"><div><BookOpen :size="15" /><strong>{{ citation.title }}</strong></div><span class="score-pill">语义匹配度 {{ citation.score }}</span></div>
-            <p>“...{{ citation.quote }}...”</p>
-          </button>
-        </section>
-
-        <section class="analysis-card surface">
-          <div class="analysis-header">
-            <div class="analysis-icon"><Stethoscope :size="19" /></div>
-            <div class="analysis-heading"><strong>智能分析</strong><span>基于循证医学指南 · 智医问康临床辅助生成</span></div>
-            <span class="complete-pill"><CheckCircle2 :size="15" /> 生成完成</span>
-          </div>
-          <div class="analysis-title"><i></i>{{ activeContent.analysisTitle }}</div>
-          <div class="analysis-body">
-            <p>{{ activeContent.analysis }}</p>
-          </div>
-          <div class="recommendation-row"><div><HeartPulse :size="15" /><strong>建议下一步</strong></div><span>{{ activeContent.recommendation }}</span></div>
-        </section>
-
-        <section v-for="exchange in exchanges" :key="exchange.id" class="exchange-thread">
-          <div class="exchange-user"><div class="patient-avatar small">患</div><div><strong>补充信息</strong><span>{{ exchange.sentAt }}</span><p>{{ exchange.userText }}<small v-if="exchange.fileName"><FileText :size="13" /> {{ exchange.fileName }}</small></p></div></div>
-          <div class="exchange-assistant"><div class="analysis-icon"><Stethoscope :size="17" /></div><div><strong>智医问康</strong><span>{{ exchange.sentAt }} · mock 回复</span><p>{{ exchange.assistantText }}</p></div></div>
-        </section>
+        <button class="sidebar-toggle" :aria-label="sidebarCollapsed ? '展开侧栏' : '收起侧栏'" :title="sidebarCollapsed ? '展开侧栏' : '收起侧栏'" @click="toggleSidebar"><ChevronRight v-if="sidebarCollapsed" :size="18" /><ChevronLeft v-else :size="18" /></button>
+        <template v-if="!sidebarCollapsed">
+        <button class="new-consult" :disabled="!patientId || busy || creatingConversation" @click="newConversation"><Plus :size="19" />新建智能问诊</button>
+        <section class="patient-panel live-patient"><div class="panel-heading"><span>当前咨询对象</span><button :disabled="busy" @click="openPatientForm()">新增档案</button></div><select v-model="patientId" aria-label="选择患者" :disabled="busy" @change="selectPatient"><option value="">请选择患者</option><option v-for="patient in patients" :key="patient.id" :value="patient.id">{{ patient.name }}</option></select><template v-if="currentPatient"><div class="patient-summary"><strong>{{ currentPatient.name }}</strong><span>{{ currentPatient.gender || '性别未提供' }} · {{ currentPatient.birthDate ? `出生 ${currentPatient.birthDate.slice(0, 10)}` : '出生日期未提供' }}</span><span>过敏史：{{ currentPatient.allergies.join('、') || '未提供' }}</span><span>既往史：{{ currentPatient.medicalHistory.join('、') || '未提供' }}</span><span>当前用药：{{ currentPatient.medications.join('、') || '未提供' }}</span></div><button class="text-button" :disabled="busy" @click="openPatientForm(true)">编辑档案</button></template><p v-else class="muted">请新增或选择明确的咨询对象。</p></section>
+        <section class="history-panel"><div class="history-heading"><div><History :size="17" />历史咨询</div><span class="count-pill">共 {{ conversations.length }} 条</span></div><div class="history-list"><button v-for="conversation in conversations" :key="conversation.id" class="history-item" :class="{ selected: conversation.id === activeConversationId }" :disabled="busy" @click="selectConversation(conversation)"><strong>{{ conversation.title }}</strong><small>{{ timeLabel(conversation.updatedAt) }}</small></button><p v-if="!conversations.length" class="muted">暂无历史会话</p></div></section>
+        <section class="database-panel"><div class="database-title"><ShieldCheck :size="17" />当前可检索证据</div><ul><li v-for="document in readyDocuments" :key="document.id">{{ document.name }}</li></ul><p v-if="!readyDocuments.length" class="muted">暂无可检索文档，请先上传知识文件。</p></section>
         </template>
-
-        <div v-if="busy" class="exchange-assistant streaming-reply">
-          <div class="analysis-icon"><Stethoscope :size="17" /></div>
-          <div><strong>智医问康</strong><span>{{ streamStatus || '正在生成回复…' }}</span><p>{{ streamedReply || streamStatus || '正在连接问诊服务…' }}</p></div>
-        </div>
-
-        <section class="followup-card surface">
-          <div class="followup-heading"><div><ClipboardList :size="17" /><strong>追问补充病情或上传化验单</strong></div><span><i></i> 支持医患隐私脱敏</span></div>
-          <div class="composer">
-            <textarea v-model="inputText" placeholder="请输入补充症状（例如：是否排黑便、既往有无胃病史、近期是否处于高压熬夜状态等）..." @keydown.ctrl.enter.prevent="sendSupplement"></textarea>
-            <div class="composer-bottom">
-              <div class="attachment-actions">
-                <label class="attach-button"><FilePlus2 :size="15" /> 化验单/报告<input type="file" accept=".pdf,.png,.jpg,.jpeg,.doc,.docx" @change="attachFile" /></label>
-                <label class="attach-button"><Camera :size="15" /> 舌苔/体征<input type="file" accept="image/*" @change="attachFile" /></label>
-                <button class="attach-icon" type="button" title="语音输入" @click="notice = '语音输入接口待接入'"><Mic :size="16" /></button>
-                <span v-if="selectedFile" class="file-chip"><FileText :size="13" />{{ selectedFile.name }}<button type="button" aria-label="移除附件" @click="removeFile"><X :size="13" /></button></span>
-              </div>
-              <button class="send-button" type="button" :disabled="busy || (!inputText.trim() && !selectedFile)" @click="sendSupplement">{{ busy ? '生成中…' : '发送补充' }} <Send :size="15" /></button>
-            </div>
-          </div>
-        </section>
+      </aside>
+      <main class="main-content">
+        <section v-if="!messages.length" class="empty-consult surface"><div class="empty-icon"><Stethoscope :size="24" /></div><h2>{{ loading ? '正在加载真实数据…' : '开始智能问诊' }}</h2><p>选择患者并确保知识文档可检索后，描述症状、持续时间和相关病史。</p><p>刷新页面会重新读取服务器保存的全部历史消息。</p></section>
+        <section v-for="message in messages" :key="message.id" class="surface message-card" :class="message.role"><div class="message-heading"><strong>{{ message.role === 'user' ? '患者描述' : '智医问康 · 智能分析' }}</strong><span>{{ timeLabel(message.createdAt) }} · {{ message.status === 'generating' ? '生成中' : message.status === 'failed' ? '生成失败' : '已保存' }}</span></div><p class="message-content">{{ message.content || (message.status === 'generating' ? '正在检索与生成…' : '本轮未产生回答') }}</p><p v-if="message.status === 'failed'" class="failure-text">本轮回答未完成；请查看错误提示，确认服务恢复后重新发送问题。</p><button v-for="citation in message.citations" :key="citation.chunkId" class="evidence-card" @click="viewerCitation = citation"><div class="evidence-head"><div><BookOpen :size="15" /><strong>{{ citation.documentName }}</strong></div><span>查看引用原文</span></div><p>{{ citation.quote }}</p><small>{{ citation.headingPath.join(' / ') }}</small></button></section>
+        <div v-if="busy" role="status" class="stream-status">{{ streamStatus }}</div>
+        <section class="followup-card surface"><div class="followup-heading"><div><Stethoscope :size="17" /><strong>{{ selectedConversation ? `继续问诊：${selectedConversation.title}` : '描述本次咨询问题' }}</strong></div></div><p v-if="!readyDocuments.length" class="failure-text">知识库无可用证据，暂不发送问诊。</p><div class="composer"><textarea v-model="inputText" :disabled="busy" placeholder="请输入症状、持续时间、相关病史和目前用药（Ctrl + Enter 发送）" @keydown.ctrl.enter.prevent="sendMessage"></textarea><div class="composer-bottom"><span class="muted">附件、独立搜索、通知和语音暂未启用</span><button class="send-button" :disabled="busy || loading || !patientId || !readyDocuments.length || !inputText.trim()" @click="sendMessage">{{ busy ? '生成中…' : '发送问诊' }}<Send :size="15" /></button></div></div></section>
       </main>
     </div>
-
-    <footer class="footer-bar"><strong>免责声明与合规说明：</strong>本平台AI生成内容严格基于国家卫健委规范及临床循证指南，仅供健康健康参考与分诊建议，不可替代执业医师面诊。<span class="footer-spacer"></span><span><ShieldCheck :size="13" /> 数据同步：NMPA药监局与卫健委 2024.Q4</span><span>京ICP备20240982号-1</span></footer>
-
-    <transition name="fade">
-      <div v-if="viewerCitation" class="viewer-backdrop" @click.self="viewerCitation = null">
-        <section class="document-viewer">
-          <header><div><FileText :size="18" /><div><strong>{{ viewerCitation.title }}</strong><span>{{ viewerCitation.chapter }} · PDF 第 {{ viewerCitation.page }} 页</span></div></div><button type="button" title="关闭" @click="viewerCitation = null"><X :size="19" /></button></header>
-          <div class="viewer-toolbar"><button type="button"><Menu :size="15" /> 目录</button><span class="page-nav">第 <b>{{ viewerCitation.page }}</b> / 48 页</span><button type="button">−</button><span>100%</span><button type="button">+</button><button class="download-link" type="button"><FileText :size="14" /> 原文</button></div>
-          <div class="pdf-page"><div class="pdf-kicker">中华医学会消化病学分会</div><h2>{{ viewerCitation.chapter }}</h2><div class="pdf-rule"></div><p>消化性溃疡是指胃肠道黏膜被胃酸和胃蛋白酶消化而造成的溃疡，常见于胃和十二指肠。临床表现与溃疡部位、大小、病程及有无并发症有关。</p><p class="pdf-highlight">{{ viewerCitation.quote }}</p><p>典型的消化性溃疡具有慢性、周期性和节律性的特点。患者可表现为上腹部疼痛、反酸、嗳气等，部分患者症状不典型或无症状。</p><h3>诊断与评估</h3><p>应结合病史、体格检查及必要的辅助检查综合判断。幽门螺杆菌感染是消化性溃疡的重要病因，可根据患者情况选择尿素呼气试验、粪便抗原检测或内镜检查。</p><div class="pdf-page-number">— {{ viewerCitation.page }} —</div></div>
-          <div class="viewer-source-note"><Check :size="15" /> 已定位到引用内容 <span>来源片段 {{ viewerCitation.id }}</span></div>
-        </section>
-      </div>
-    </transition>
-    <transition name="fade"><div v-if="notice" class="toast"><CheckCircle2 :size="16" />{{ notice }}</div></transition>
+    <footer class="footer-bar">AI 内容用于健康参考与分诊建议，不能替代执业医师面诊。</footer>
+    <SourceViewer v-if="viewerCitation" :key="viewerCitation.documentId + viewerCitation.chunkId" :citation="viewerCitation" @close="viewerCitation = null" />
+    <div v-if="showPatientForm" class="viewer-backdrop" @click.self="showPatientForm = false"><form class="patient-form surface" @submit.prevent="savePatient"><h2>{{ editingPatientId ? '编辑患者档案' : '新增患者档案' }}</h2><label>姓名或称呼<input v-model="patientForm.name" required maxlength="100" /></label><label>性别<select v-model="patientForm.gender"><option value="">未知 / 未提供</option><option value="男">男</option><option value="女">女</option><option value="其他">其他</option></select></label><label>出生日期（未知请留空，不按年龄推算）<input v-model="patientForm.birthDate" type="date" /></label><label>过敏史（每行一项，未知留空）<textarea v-model="patientForm.allergies"></textarea></label><label>既往病史（每行一项）<textarea v-model="patientForm.medicalHistory"></textarea></label><label>当前用药（每行一项）<textarea v-model="patientForm.medications"></textarea></label><div class="form-actions"><button type="button" class="secondary-button" @click="showPatientForm = false">取消</button><button class="send-button" :disabled="patientBusy || !patientForm.name.trim()">{{ patientBusy ? '保存中…' : '保存档案' }}</button></div></form></div>
   </div>
 </template>

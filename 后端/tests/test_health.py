@@ -1,7 +1,8 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from medical_consultation_backend.main import app, create_app
+from app.core.config import Settings
+from app.main import app, create_app
 
 
 @pytest.mark.asyncio
@@ -49,3 +50,20 @@ async def test_validation_error_does_not_echo_input() -> None:
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
     assert "private-content" not in response.text
+
+
+async def test_lifespan_task_status_and_shutdown() -> None:
+    test_app = create_app(Settings(_env_file=None, external_services_enabled=False))
+    async with test_app.router.lifespan_context(test_app):
+        record = test_app.state.task_queue.submit("demo.noop")
+        await test_app.state.task_queue.join()
+        async with AsyncClient(
+            transport=ASGITransport(app=test_app), base_url="http://test"
+        ) as client:
+            response = await client.get(f"/api/tasks/{record.id}")
+            missing = await client.get("/api/tasks/does-not-exist")
+        assert response.json()["status"] == "succeeded"
+        assert "payload" not in response.json()
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "TASK_NOT_FOUND"
+    assert not test_app.state.task_queue.accepting

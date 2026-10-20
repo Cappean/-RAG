@@ -1,0 +1,1 @@
+"""Medical consultation application package."""

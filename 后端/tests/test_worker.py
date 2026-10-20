@@ -1,120 +1,88 @@
+"""Exercise accepted queue design, replacing retired Mongo lease/retry tests."""
+
 import asyncio
 
 import pytest
 
-from medical_consultation_backend.core.config import Settings
-from medical_consultation_backend.tasks.handlers import HANDLERS
-from medical_consultation_backend.tasks.models import Job
-from medical_consultation_backend.tasks.worker import Worker
+from app.core.errors import AppError
+from app.worker.handlers import HANDLERS
+from app.worker.queue import MemoryTaskQueue
+from app.worker.runner import Worker
 
 
-class MemoryRepository:
-    def __init__(self) -> None:
-        self.job = Job(kind="demo.noop")
-        self.completed: dict | None = None
-        self.failures: list[bool] = []
-
-    async def claim(self, lease_seconds: float):
-        if self.job.status != "queued":
-            return None
-        self.job.status = "running"
-        self.job.attempts += 1
-        self.job.lease_token = "test"
-        return self.job
-
-    async def heartbeat(self, job, lease_seconds):
-        return True
-
-    async def complete(self, job, result):
-        self.job.status = "succeeded"
-        self.completed = result
-        return True
-
-    async def fail(self, job, permanent=False):
-        self.failures.append(permanent)
-        self.job.status = "failed" if permanent or job.attempts >= job.max_attempts else "queued"
-        return True
-
-
-@pytest.mark.asyncio
 async def test_worker_executes_handler_once() -> None:
-    repository = MemoryRepository()
-    worker = Worker(repository, HANDLERS, Settings(worker_heartbeat_seconds=1))
-    assert await worker.run_once() is True
-    assert repository.job.status == "succeeded"
-    assert repository.completed == {"processed": True, "jobId": repository.job.id}
+    queue = MemoryTaskQueue()
+    record = queue.submit("demo.noop")
+    await Worker(queue, HANDLERS).run_once()
+    assert record.status == "succeeded"
+    assert record.result == {"processed": True, "taskId": record.id}
 
 
-async def test_unknown_handler_fails_without_retry() -> None:
-    repository = MemoryRepository()
-    repository.job.kind = "not.registered"
-    worker = Worker(repository, HANDLERS, Settings())
+async def test_failure_isolation_and_no_retry_or_sensitive_error() -> None:
+    queue = MemoryTaskQueue()
+
+    async def failing(record):
+        raise RuntimeError("sensitive clinical text")
+
+    first = queue.submit("failure")
+    second = queue.submit("demo.noop")
+    worker = Worker(queue, {**HANDLERS, "failure": failing})
     await worker.run_once()
-    assert repository.job.status == "failed"
-    assert repository.failures == [True]
-
-
-async def test_transient_failure_retries_until_limit() -> None:
-    repository = MemoryRepository()
-    repository.job.max_attempts = 2
-
-    async def failing(job):
-        raise RuntimeError("temporary")
-
-    worker = Worker(repository, {"demo.noop": failing}, Settings())
     await worker.run_once()
-    assert repository.job.status == "queued"
+    assert first.status == "failed"
+    assert "sensitive" not in first.error
+    assert second.status == "succeeded"
+
+
+async def test_queue_rejects_overflow_without_registering_new_record() -> None:
+    queue = MemoryTaskQueue(capacity=1)
+    record = queue.submit("demo.noop")
+    with pytest.raises(AppError, match="队列已满"):
+        queue.submit("demo.noop")
+    assert queue.get(record.id) is record
+
+
+async def test_completed_retention_does_not_evict_unfinished_tasks() -> None:
+    queue = MemoryTaskQueue(completed_retention=1)
+    first = queue.submit("demo.noop")
+    second = queue.submit("demo.noop")
+    pending = queue.submit("demo.noop")
+    worker = Worker(queue, HANDLERS)
     await worker.run_once()
-    assert repository.job.status == "failed"
-    assert repository.job.attempts == 2
-    assert repository.completed is None
+    await worker.run_once()
+    with pytest.raises(AppError, match="不存在"):
+        queue.get(first.id)
+    assert queue.get(second.id).status == "succeeded"
+    assert queue.get(pending.id).status == "queued"
 
 
-async def test_lease_loss_cancels_execution_without_acknowledging() -> None:
-    repository = MemoryRepository()
+async def test_unknown_handler_is_terminal_failure() -> None:
+    queue = MemoryTaskQueue()
+    record = queue.submit("unknown")
+    await Worker(queue, HANDLERS).run_once()
+    assert record.status == "failed"
+
+
+async def test_shutdown_cancels_active_and_pending_tasks_and_closes_admission() -> None:
+    queue = MemoryTaskQueue()
+    started = asyncio.Event()
     cancelled = asyncio.Event()
 
-    async def slow(job):
+    async def slow(record):
+        started.set()
         try:
             await asyncio.Event().wait()
         finally:
             cancelled.set()
 
-    async def lost_lease(job, lease_seconds):
-        return False
-
-    repository.heartbeat = lost_lease
-    worker = Worker(repository, {"demo.noop": slow}, Settings(worker_heartbeat_seconds=0.005))
-    await asyncio.wait_for(worker.run_once(), timeout=1)
+    first = queue.submit("slow")
+    second = queue.submit("slow")
+    worker = Worker(queue, {"slow": slow})
+    await worker.start()
+    await asyncio.wait_for(started.wait(), 1)
+    await worker.stop(timeout=0.01)
     assert cancelled.is_set()
-    assert repository.completed is None
-    assert repository.failures == []
-
-
-async def test_cancelled_worker_leaves_job_for_lease_recovery() -> None:
-    repository = MemoryRepository()
-    started = asyncio.Event()
-
-    async def slow(job):
-        started.set()
-        await asyncio.Event().wait()
-
-    worker = Worker(repository, {"demo.noop": slow}, Settings())
-    task = asyncio.create_task(worker.run_once())
-    await asyncio.wait_for(started.wait(), timeout=1)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert repository.job.status == "running"
-    assert repository.completed is None
-    assert repository.failures == []
-
-
-async def test_worker_shutdown_stops_polling() -> None:
-    repository = MemoryRepository()
-    repository.job.status = "succeeded"
-    worker = Worker(repository, HANDLERS, Settings(worker_poll_seconds=0.005))
-    stop = asyncio.Event()
-    task = asyncio.create_task(worker.run(stop))
-    stop.set()
-    await asyncio.wait_for(task, timeout=1)
+    assert first.status == second.status == "failed"
+    await asyncio.wait_for(queue.join(), 1)
+    with pytest.raises(AppError, match="停止接收"):
+        queue.submit("slow")

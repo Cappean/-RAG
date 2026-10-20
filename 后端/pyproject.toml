@@ -5,9 +5,18 @@ description = "医疗智能问诊后端基础框架"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "anyio>=4,<5",
     "fastapi>=0.115,<1",
+    "minio>=7.2,<8",
+    "openai>=2,<3",
     "pydantic-settings>=2.8,<3",
+    "pymilvus>=2.6,<2.7",
     "pymongo>=4.13,<5",
+    "python-multipart>=0.0.20,<1",
+    "python-dotenv>=1,<2",
+    "sentencepiece>=0.2,<1",
+    "torch>=2.6,<3",
+    "transformers>=4.50,<5",
     "uvicorn>=0.34,<1",
 ]
 
@@ -15,18 +24,19 @@ dependencies = [
 dev = ["httpx>=0.28,<1", "pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.11,<1"]
 
 [project.scripts]
-medical-api = "medical_consultation_backend.cli:api"
-medical-worker = "medical_consultation_backend.cli:worker"
-medical-init-db = "medical_consultation_backend.cli:init_db"
-medical-enqueue-demo = "medical_consultation_backend.cli:enqueue_demo"
+medical-api = "app.main:api"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+module-name = "app"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py313"
