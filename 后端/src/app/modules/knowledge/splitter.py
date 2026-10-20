@@ -95,6 +95,20 @@ def _invalid(message="解析产物含无法可靠识别的结构，未完成入�
     return AppError("DOCUMENT_STRUCTURE_UNSUPPORTED", message, 422)
 
 
+# 版式装饰类记录：页眉、页脚、页码、页边竖排文字、被版面模型判定丢弃的内容。
+# 这些文字重复出现在每页且不承载检索价值，跳过但要计数，避免看起来像静默吞内容。
+SKIPPED_LAYOUT_TYPES = {
+    "page_header",
+    "page_footer",
+    "page_number",
+    "page_aside_text",
+    "discarded",
+}
+
+# 行间公式：LaTeX 无法可靠转成可检索的自然语言，正文通常有等价表述，跳过并计数。
+SKIPPED_FORMULA_TYPES = {"equation_interline"}
+
+
 def _text(value):
     """Extract only documented inline text nodes, preserving math/link labels."""
     if isinstance(value, str):
@@ -158,19 +172,27 @@ def mineru_blocks(path: Path) -> list[Block]:
         raise _invalid("MinerU content_list_v2 必须是按页排列的二维数组")
     blocks, stack = [], []
     skipped, toc_active = 0, False
+    skipped_by_type: dict[str, int] = {}
+
+    def skip(reason: str) -> None:
+        """统一记录跳过原因，日志里的分项之和必须等于 excluded 总数。"""
+        nonlocal skipped
+        skipped += 1
+        skipped_by_type[reason] = skipped_by_type.get(reason, 0) + 1
+
     for page_number, records in enumerate(pages, 1):
         for record in records:
             if not isinstance(record, dict) or not isinstance(record.get("content"), dict):
-                raise _invalid()
+                raise _invalid(f"解析产物第 {page_number} 页存在缺少内容字段的记录")
             kind, data = record.get("type"), record["content"]
-            if kind in {"page_header", "page_footer", "page_number", "discarded"}:
-                skipped += 1
+            if kind in SKIPPED_LAYOUT_TYPES or kind in SKIPPED_FORMULA_TYPES:
+                skip(kind)
                 continue
             if kind == "title":
                 title = _text(data.get("title_content", [])).strip()
                 if re.fullmatch(r"目\s*录|Table\s+of\s+Contents|Contents", title, re.I):
                     toc_active = True
-                    skipped += 1
+                    skip("toc_title")
                     continue
                 if title:
                     toc_active = False
@@ -181,13 +203,13 @@ def mineru_blocks(path: Path) -> list[Block]:
                 "reference",
                 "toc",
             }:
-                skipped += 1
+                skip("reference_or_toc")
                 continue
             headings = [item[1] for item in stack]
             if headings and re.match(
                 r"^(?:\d+[.、\s]*)?(参考文献|References)\s*$", headings[-1], re.I
             ):
-                skipped += 1
+                skip("reference_section")
                 continue
             location = {"pageNumber": page_number, "bbox": None}
             bbox = record.get("bbox")
@@ -212,7 +234,7 @@ def mineru_blocks(path: Path) -> list[Block]:
                 paragraph = _text(data.get("paragraph_content", []))
                 paragraph, toc_active = _toc_lines(paragraph, toc_active)
                 if not paragraph.strip():
-                    skipped += 1
+                    skip("toc_text")
                     logger.debug("textual TOC excluded page=%s", page_number)
                     continue
                 texts, output_kind = [paragraph], "paragraph"
@@ -223,14 +245,34 @@ def mineru_blocks(path: Path) -> list[Block]:
                 texts, output_kind = [_text(item.get("item_content", [])) for item in items], "list"
             elif kind == "table":
                 html = data.get("html")
-                if not isinstance(html, str) or not re.search(r"<tr\b", html, re.I):
-                    raise _invalid("表格缺少可靠 HTML 行列结构")
+                if not isinstance(html, str):
+                    raise _invalid(f"解析产物第 {page_number} 页的表格缺少 html 字段")
+                if not html.strip():
+                    # 只以图片形式存在、没有抽出行列结构的表格：保留题注和脚注，
+                    # 表格正文本身没有可索引文本，跳过但计数，不当成结构损坏。
+                    caption = _text(data.get("table_caption", []))
+                    footnote = _text(data.get("table_footnote", []))
+                    combined = "\n".join(part for part in (caption, footnote) if part.strip())
+                    if combined.strip():
+                        blocks.append(
+                            Block(combined, "footnote", headings.copy(), [location.copy()])
+                        )
+                    skip("table_image_only")
+                    continue
+                if not re.search(r"<tr\b", html, re.I):
+                    raise _invalid(f"解析产物第 {page_number} 页的表格 HTML 缺少行列结构")
                 texts, output_kind = [html], "table"
                 captions = _text(data.get("table_caption", []))
                 footnotes = _text(data.get("table_footnote", []))
                 for extra in (captions, footnotes):
                     if extra.strip():
                         blocks.append(Block(extra, "footnote", headings.copy(), [location.copy()]))
+            elif kind == "code":
+                # 治疗方案剂量表常被解析成 code 块，这是必须保留的正文而不是装饰。
+                caption = _text(data.get("code_caption", []))
+                body_text = _text(data.get("code_content", []))
+                combined = "\n".join(part for part in (caption, body_text) if part.strip())
+                texts, output_kind = [combined], "paragraph"
             elif kind in {"image", "chart"}:
                 texts = [
                     _text(data.get("content", ""))
@@ -242,12 +284,17 @@ def mineru_blocks(path: Path) -> list[Block]:
                 texts, output_kind = [_text(data.get(f"{kind}_content", []))], "footnote"
             else:
                 logger.info("unsupported parser record page=%s type=%s", page_number, kind)
-                raise _invalid()
+                # 带上页码和类型名：只报“无法识别”会让排查必须去翻 JSON。
+                raise _invalid(f"解析产物第 {page_number} 页存在未支持的记录类型：{kind}")
             for text in texts:
                 if text.strip():
                     blocks.append(Block(text, output_kind, headings.copy(), [location.copy()]))
     logger.info(
-        "MinerU structures read pages=%s blocks=%s excluded=%s", len(pages), len(blocks), skipped
+        "MinerU structures read pages=%s blocks=%s excluded=%s detail=%s",
+        len(pages),
+        len(blocks),
+        skipped,
+        skipped_by_type,
     )
     return blocks
 

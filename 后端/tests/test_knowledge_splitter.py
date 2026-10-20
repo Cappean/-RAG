@@ -111,8 +111,71 @@ def test_pdf_cross_page_locations_and_heading_hierarchy(tmp_path):
 def test_unknown_pdf_structure_is_not_silent_success(tmp_path):
     path = tmp_path / "content_list_v2.json"
     path.write_text('[[{"type":"future_widget","content":{}}]]')
-    with pytest.raises(AppError, match="无法可靠识别"):
+    with pytest.raises(AppError) as exc:
         mineru_blocks(path)
+    assert exc.value.code == "DOCUMENT_STRUCTURE_UNSUPPORTED"
+    # 报错必须指出页码和类型，否则排查只能去翻原始 JSON。
+    assert "第 1 页" in exc.value.message
+    assert "future_widget" in exc.value.message
+
+
+def test_layout_asides_and_inline_math_are_skipped_without_failing(tmp_path):
+    """真实指南里会同时出现页边竖排文字和行间公式，不能让整份文档失败。"""
+    path = tmp_path / "content_list_v2.json"
+    path.write_text(
+        json.dumps(
+            [
+                [
+                    {
+                        "type": "page_aside_text",
+                        "content": {
+                            "page_aside_text_content": [
+                                {"type": "text", "content": "CSCO 结直肠癌诊疗指南 2026 更新要点"}
+                            ]
+                        },
+                        "bbox": [952, 466, 976, 689],
+                    },
+                    {
+                        "type": "equation_interline",
+                        "content": {"math_content": "\\mathrm{N} _ {2 0}", "math_type": "latex"},
+                        "bbox": [184, 455, 215, 470],
+                    },
+                    {
+                        "type": "paragraph",
+                        "content": {"paragraph_content": "真实正文保留。"},
+                    },
+                ]
+            ]
+        )
+    )
+    blocks = mineru_blocks(path)
+    assert [block.text for block in blocks] == ["真实正文保留。"]
+
+
+def test_code_block_keeps_regimen_text(tmp_path):
+    """化疗剂量方案常被解析成 code 块，属于必须入库的临床内容。"""
+    path = tmp_path / "content_list_v2.json"
+    regimen = "CAPEOX\n奥沙利铂 130mg/m², 静脉输注 2 小时, 第 1 天"
+    path.write_text(
+        json.dumps(
+            [
+                [
+                    {
+                        "type": "code",
+                        "content": {
+                            "code_caption": [],
+                            "code_content": [{"type": "text", "content": regimen}],
+                            "code_language": "txt",
+                        },
+                    }
+                ]
+            ]
+        )
+    )
+    blocks = mineru_blocks(path)
+    assert len(blocks) == 1
+    assert blocks[0].text == regimen
+    assert blocks[0].kind == "paragraph"
 
 
 def test_unverified_normalized_bbox_keeps_page_without_inventing_coordinates(tmp_path):
