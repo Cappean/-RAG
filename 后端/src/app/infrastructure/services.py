@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from pymongo import AsyncMongoClient
 
+from app.common.stages import MARKDOWN_SKIPPED_STAGES
 from app.core.errors import AppError
 from app.core.loggingUtils import get_logger
 from app.infrastructure.mineru import MinerUClient
@@ -73,10 +74,21 @@ async def initialize(application, settings, queue, worker):
         await consultation.recover()
 
         async def ingest(task):
-            task.progress = "解析、切分及向量入库"
-            return await knowledge.process_document(
-                task.payload["documentId"], lambda stage: setattr(task, "progress", stage)
+            document_id = task.payload["documentId"]
+            # 不适用阶段由任务在开始前声明，页面据此把“解析文档”渲染为跳过。
+            document = await knowledge.get_document(document_id)
+            task.skipped_stages = (
+                list(MARKDOWN_SKIPPED_STAGES) if document["sourceType"] == "md" else []
             )
+
+            def on_stage(stage, detail=None):
+                # 只记录真实阶段与阶段内计数，进度条不据此推算百分比。
+                task.stage, task.stage_detail = stage, detail
+
+            result = await knowledge.process_document(document_id, on_stage)
+            # 全部写入成功后才把任务推进到完成态，避免“已勾选但尚未入库”。
+            task.stage, task.stage_detail = "done", None
+            return result
 
         worker.handlers["knowledge.ingest"] = ingest
         application.state.services = SimpleNamespace(

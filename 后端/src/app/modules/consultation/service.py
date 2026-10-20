@@ -6,6 +6,14 @@ from datetime import UTC, datetime
 import anyio
 from bson import ObjectId
 
+from app.common.titles import (
+    DEFAULT_TITLE,
+    TITLE_SOURCE_AUTO,
+    TITLE_SOURCE_USER,
+    fallback_title,
+    needs_generated_title,
+    normalize_title,
+)
 from app.core.errors import AppError
 from app.core.loggingUtils import get_logger
 from app.modules.consultation.model import conversation_view, message_view
@@ -74,6 +82,72 @@ class ConsultationService:
         records = await self.repository.history(conversation_id(identifier))
         logger.debug("messages read conversation_id=%s count=%s", identifier, len(records))
         return [message_view(record) for record in records]
+
+    async def rename(self, identifier, title):
+        """用户改名后标记来源为 user，自动标题不再覆盖。"""
+        record = await self.repository.get(conversation_id(identifier))
+        if record is None:
+            raise AppError("CONVERSATION_NOT_FOUND", "会话不存在", 404)
+        cleaned = (title or "").strip()
+        if not cleaned:
+            raise AppError("TITLE_INVALID", "标题不能为空", 422)
+        await self.repository.update_title(record["_id"], cleaned, TITLE_SOURCE_USER)
+        # 标题属于临床相关内容，日志只记录长度。
+        logger.info("conversation renamed conversation_id=%s chars=%s", record["_id"], len(cleaned))
+        return conversation_view({**record, "title": cleaned, "titleSource": TITLE_SOURCE_USER})
+
+    async def delete(self, identifier):
+        identifier = str(conversation_id(identifier))
+        # 在途生成持有会话引用与并发锁，删除会留下写入已删会话的脏路径。
+        if identifier in self.active:
+            raise AppError("GENERATION_CONFLICT", "本会话正在生成回答，请等待完成后再删除", 409)
+        record = await self.repository.get(ObjectId(identifier))
+        if record is None:
+            raise AppError("CONVERSATION_NOT_FOUND", "会话不存在", 404)
+        removed = await self.repository.delete(ObjectId(identifier))
+        logger.info(
+            "conversation deleted conversation_id=%s messages_deleted=%s", identifier, removed
+        )
+        return {"deleted": True, "conversationId": identifier, "messagesDeleted": removed}
+
+    async def name_turn(self, identifier, question):
+        """首轮结束后生成一次标题；任何失败都只回退，不影响已保存的回答。"""
+        try:
+            record = await self.repository.get(ObjectId(identifier))
+            if record is None or not needs_generated_title(record):
+                return
+            max_chars = getattr(self.settings, "title_max_chars", 24)
+            suggestion = ""
+            try:
+                suggestion = await asyncio.wait_for(
+                    self.rag.suggest_title(question),
+                    getattr(self.settings, "title_timeout_seconds", 3.0),
+                )
+            except Exception as exc:
+                # 超时或模型不可用都属于可降级情况，不能让标题影响问诊结果。
+                logger.info(
+                    "title generation failed conversation_id=%s exception_type=%s",
+                    identifier,
+                    type(exc).__name__,
+                )
+            title = (
+                normalize_title(suggestion, max_chars)
+                or fallback_title(question, max_chars)
+                or DEFAULT_TITLE
+            )
+            await self.repository.update_title(ObjectId(identifier), title, TITLE_SOURCE_AUTO)
+            logger.info(
+                "conversation titled conversation_id=%s source=%s chars=%s",
+                identifier,
+                TITLE_SOURCE_AUTO,
+                len(title),
+            )
+        except Exception as exc:
+            logger.warning(
+                "title update skipped conversation_id=%s exception_type=%s",
+                identifier,
+                type(exc).__name__,
+            )
 
     async def begin(self, identifier, content):
         """Reserve and persist before HTTP headers so validation/conflicts are 4xx."""
@@ -193,13 +267,21 @@ class Turn:
                 "assistant_created",
                 {"message": message_view(self.assistant), "userMessage": message_view(self.user)},
             )
-            yield "status", {"stage": "retrieving"}
             async with asyncio.timeout(
                 getattr(self.service.settings, "generation_timeout_seconds", 180)
             ):
-                prepared = await self.service.rag.prepare(
+                prepared = None
+                # RAG reports each real step boundary; forward it before the work
+                # finishes so the page never displays an invented timeline.
+                async for kind, value in self.service.rag.prepare_steps(
                     self.user["content"], self.history, self.patient
-                )
+                ):
+                    if kind == "stage":
+                        yield "status", {"stage": value}
+                    else:
+                        prepared = value
+                if prepared is None:
+                    raise AppError("RAG_PREPARE_INCOMPLETE", "检索流程没有产生可用结果", 503)
                 self.assistant["citations"] = prepared["citations"]
                 # Persist evidence and occasional text snapshots, never each token.
                 await self.service.repository.update_message(
@@ -210,7 +292,7 @@ class Turn:
                     "citations",
                     {"messageId": str(self.assistant["_id"]), "citations": prepared["citations"]},
                 )
-                yield "status", {"stage": "generating", "retrievalMs": prepared["retrievalMs"]}
+                yield "status", {"stage": "generation", "retrievalMs": prepared["retrievalMs"]}
                 checkpoint = 0
                 async for token in self.service.rag.stream(prepared):
                     self.assistant["content"] += token
@@ -224,6 +306,10 @@ class Turn:
                 if not self.assistant["content"].strip():
                     raise AppError("EMPTY_MODEL_RESPONSE", "模型未返回回答，请稍后重试", 502)
             await self.close("completed")
+            # 回答已经落库，再来生成标题；超时也只回退，不改变本轮结果。
+            await self.service.name_turn(self.identifier, self.user["content"])
+            # Terminal step is reported only after persistence actually succeeded.
+            yield "status", {"stage": "done"}
             yield (
                 "done",
                 {"message": message_view(self.assistant), "retrievalMs": prepared["retrievalMs"]},

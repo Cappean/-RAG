@@ -86,3 +86,24 @@ async def test_shutdown_cancels_active_and_pending_tasks_and_closes_admission() 
     await asyncio.wait_for(queue.join(), 1)
     with pytest.raises(AppError, match="停止接收"):
         queue.submit("slow")
+
+
+async def test_task_public_state_carries_real_stage_and_failed_stage() -> None:
+    """The stepper is driven by these fields, so they must survive serialization."""
+    queue = MemoryTaskQueue()
+
+    async def staged(record):
+        record.stage, record.stage_detail = "vectorize", "8/24"
+        record.skipped_stages = ["parse"]
+        raise AppError("DOCUMENT_PROCESSING_FAILED", "向量写入失败", 503)
+
+    record = queue.submit("staged", {"documentId": "document-1"})
+    await Worker(queue, {"staged": staged}).run_once()
+    public = queue.get(record.id).public()
+    assert public["status"] == "failed"
+    assert public["stage"] == "vectorize"
+    assert public["stageDetail"] == "8/24"
+    assert public["failedStage"] == "vectorize"
+    assert public["skippedStages"] == ["parse"]
+    assert public["documentId"] == "document-1"
+    assert public["error"] == "向量写入失败"

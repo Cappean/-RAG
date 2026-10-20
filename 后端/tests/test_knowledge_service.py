@@ -1,6 +1,7 @@
 """Workflow failure/dedup tests with explicit in-memory external replacements."""
 
 import asyncio
+import hashlib
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,12 +42,21 @@ class Repository:
 class Objects:
     def __init__(self):
         self.data = {}
+        self.file_uploads = 0
 
     def put(self, key, data, content_type):
         self.data[key] = data
 
+    def put_file(self, key, path, content_type):
+        # 生产路径按文件上传；这里读回字节，断言"没有整块字节进内存"仍可验证调用次数。
+        self.file_uploads += 1
+        self.data[key] = Path(path).read_bytes()
+
     def get(self, key):
         return self.data[key]
+
+    def download_to(self, key, path):
+        Path(path).write_bytes(self.data[key])
 
     def list(self, prefix):
         return [key for key in self.data if key.startswith(prefix)]
@@ -151,14 +161,16 @@ async def test_empty_markdown_cannot_be_ready():
     assert sut.repository.rows[identifier]["status"] == "failed"
 
 
-async def test_progress_is_reported_only_after_real_stages():
+async def test_markdown_reports_only_executed_stages_with_real_counts():
+    """Markdown has no parser step, so the stepper must never claim one ran."""
     sut = service()
     result = await sut.upload("progress.md", b"# Heading\n\nExplicit test text")
     stages = []
-    await sut.process_document(result["document"]["id"], stages.append)
-    assert stages[0] == "清理未完成的索引"
-    assert "按标题与 token 切分" in stages
-    assert stages[-1] == "入库完成"
+    await sut.process_document(
+        result["document"]["id"], lambda stage, detail=None: stages.append((stage, detail))
+    )
+    assert [stage for stage, _ in stages] == ["split", "vectorize"]
+    assert stages[-1] == ("vectorize", "1/1")
     assert sut.vectors.rows
 
 
@@ -172,11 +184,13 @@ async def test_pdf_retry_reuses_unique_saved_parser_output_without_mineru():
         b'[[{"type":"paragraph","content":{"paragraph_content":"Saved parsed text"}}]]'
     )
     stages = []
-    await sut.process_document(identifier, stages.append)
+    await sut.process_document(
+        identifier, lambda stage, detail=None: stages.append((stage, detail))
+    )
     assert sut.repository.rows[identifier]["status"] == "ready"
     assert sut.repository.chunks[0]["content"] == "Saved parsed text"
-    assert "复用已保存的 MinerU 解析产物" in stages
-    assert "MinerU 解析 PDF" not in stages
+    assert ("parse", "复用已保存的解析产物") in stages
+    assert all(detail != "MinerU 解析 PDF" for _, detail in stages)
     assert sut.mineru is None
 
 
@@ -232,3 +246,28 @@ async def test_parser_cancellation_keeps_temp_alive_but_never_publishes_late_res
     assert sut.repository.rows[identifier]["parserOutputPrefix"] is None
     assert not sut.repository.chunks
     assert not sut.vectors.rows
+
+
+async def test_oversize_upload_names_the_limit_and_writes_nothing():
+    sut = service()  # 测试配置上限 1024 字节
+    with pytest.raises(AppError) as exc:
+        await sut.upload("big.md", b"x" * 2048)
+    assert exc.value.code == "FILE_TOO_LARGE"
+    # 提示必须带上限值，否则用户不知道要压到多小。
+    assert "1 KB" in exc.value.message
+    assert not sut.objects.data
+    assert not sut.repository.rows
+
+
+async def test_production_path_uploads_from_file_not_bytes(tmp_path):
+    sut = service()
+    body = "# 标题\n\n" + "正文" * 50
+    path = tmp_path / "from-disk.md"
+    path.write_bytes(body.encode("utf-8"))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    result = await sut.upload_file("from-disk.md", path, len(body.encode()), digest)
+    assert result["duplicate"] is False
+    # 走的是按文件上传，不再把全文包进 BytesIO。
+    assert sut.objects.file_uploads == 1
+    key = f"knowledge/{result['document']['id']}/original.md"
+    assert sut.objects.data[key] == body.encode()

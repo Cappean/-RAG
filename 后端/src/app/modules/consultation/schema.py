@@ -12,3 +12,10 @@ class ConversationInput(BaseModel):
 class MessageInput(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     content: str = Field(min_length=1)
+
+
+class TitleInput(BaseModel):
+    """手工标题的硬上限；自动标题另受 title_max_chars 约束。"""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    title: str = Field(min_length=1, max_length=40)

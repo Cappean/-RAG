@@ -106,7 +106,10 @@ async def test_patient_create_edit_history_and_invalid_payloads_over_http():
 
 async def test_no_evidence_emits_terminal_error_not_done_over_http():
     class NoEvidence(Rag):
-        async def prepare(self, *args):
+        async def prepare_steps(self, *args):
+            # Failure is discovered inside the citation step, after real progress.
+            for stage in ("intake", "retrieval"):
+                yield "stage", stage
             raise AppError("NO_EVIDENCE", "明确的无证据测试", 422)
 
     app = application(NoEvidence())
@@ -178,3 +181,36 @@ async def test_asgi_disconnect_cancels_generation_and_retains_partial():
     assert history[1]["status"] == "failed"
     assert history[1]["content"] == "断连前的部分回答"
     assert not app.state.services.consultation.active
+
+
+async def test_rename_and_delete_conversation_over_http():
+    app = application()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        patient = (await client.post("/api/patients", json={"name": "标题接口测试"})).json()
+        conversation = (
+            await client.post("/api/conversations", json={"patientId": patient["id"]})
+        ).json()
+        assert conversation["titleSource"] == "default"
+
+        renamed = await client.patch(
+            f"/api/conversations/{conversation['id']}/title", json={"title": "手改标题"}
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["title"] == "手改标题"
+        assert renamed.json()["titleSource"] == "user"
+
+        # 全空白会被 schema 归一成空串，必须拒绝而不是存一个空标题。
+        blank = await client.patch(
+            f"/api/conversations/{conversation['id']}/title", json={"title": "   "}
+        )
+        assert blank.status_code == 422
+
+        deleted = await client.delete(f"/api/conversations/{conversation['id']}")
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted"] is True
+        assert (
+            await client.get(f"/api/conversations/{conversation['id']}/messages")
+        ).status_code == 404
+        assert (await client.delete(f"/api/conversations/{conversation['id']}")).status_code == 404

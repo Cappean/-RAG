@@ -4,10 +4,10 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from test_knowledge_service import service
 
 from app.core.errors import register_error_handlers
 from app.modules.knowledge.router import router
+from tests.test_knowledge_service import service
 
 
 def client_for(sut):
@@ -67,3 +67,11 @@ def test_over_limit_read_and_unsigned_original_route():
             client.get("/api/knowledge/documents/0123456789abcdef01234567/original").status_code
             == 404
         )
+
+
+def test_limits_endpoint_reports_configured_upload_ceiling():
+    sut = service()
+    with client_for(sut) as client:
+        response = client.get("/api/knowledge/limits")
+        assert response.status_code == 200
+        assert response.json() == {"uploadMaxBytes": 1024, "uploadMaxLabel": "1 KB"}

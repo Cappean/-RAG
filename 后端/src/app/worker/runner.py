@@ -27,9 +27,12 @@ class Worker:
             record.status = "succeeded"
         except asyncio.CancelledError:
             record.status, record.error = "failed", "服务关闭，任务未完成"
+            # 页面停在失败阶段，不再保留活动动画。
+            record.failed_stage = record.stage
             raise
         except Exception as exc:
             record.status = "failed"
+            record.failed_stage = record.stage
             record.error = (
                 exc.message if isinstance(exc, AppError) else "任务处理失败，请查看服务日志"
             )

@@ -1,7 +1,9 @@
 """Knowledge business workflows across MongoDB, MinIO, MinerU and Milvus."""
 
 import asyncio
+import codecs
 import hashlib
+import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +11,8 @@ from pathlib import Path
 from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
 
+from app.common.sizes import human_size
+from app.common.stages import KNOWLEDGE_STAGES, known_stage
 from app.core.errors import AppError
 from app.core.loggingUtils import get_logger
 from app.modules.knowledge.model import document_view
@@ -66,23 +70,39 @@ class KnowledgeService:
         }
 
     async def upload(self, file_name: str, data: bytes):
-        # Validate exact bytes before touching external stores, preserving hash identity.
+        """兼容入口：小体积调用方可以直接给字节，内部仍然走落盘路径。
+
+        生产请求由路由分块写临时文件后调用 `upload_file`，不会经过这里；
+        这个包装只服务于脚本与测试，避免它们各自复制一遍落盘逻辑。
+        """
+        with tempfile.NamedTemporaryFile(prefix="medical-upload-", delete=False) as handle:
+            handle.write(data)
+            path = Path(handle.name)
+        try:
+            return await self.upload_file(
+                file_name, path, len(data), hashlib.sha256(data).hexdigest()
+            )
+        finally:
+            await asyncio.to_thread(path.unlink, missing_ok=True)
+
+    async def upload_file(self, file_name: str, path: Path, size: int, digest: str):
+        """按本地文件登记一份知识文档；内存占用与文件大小无关。"""
+        # Validate before touching external stores, preserving hash identity.
         file_name = Path(file_name.replace("\\", "/")).name
         source = Path(file_name).suffix.lower().lstrip(".")
         if source not in {"pdf", "md"}:
             raise AppError("UNSUPPORTED_FILE_TYPE", "仅支持 PDF 和 Markdown 文件", 415)
-        if not data:
+        if size <= 0:
             raise AppError("EMPTY_FILE", "上传文件为空", 422)
-        if len(data) > self.settings.upload_max_bytes:
-            raise AppError("FILE_TOO_LARGE", "文件超过上传大小限制", 413)
-        if source == "pdf" and not data.lstrip().startswith(b"%PDF-"):
+        limit = self.settings.upload_max_bytes
+        if size > limit:
+            raise AppError(
+                "FILE_TOO_LARGE", f"文件超过 {human_size(limit)} 上传上限，请压缩或拆分后重试", 413
+            )
+        if source == "pdf" and not await asyncio.to_thread(self._looks_like_pdf, path):
             raise AppError("INVALID_PDF", "文件不是有效的 PDF 格式", 422)
-        if source == "md":
-            try:
-                data.decode("utf-8-sig")
-            except UnicodeDecodeError as exc:
-                raise AppError("INVALID_MARKDOWN", "Markdown 文件必须使用 UTF-8 编码", 422) from exc
-        digest = hashlib.sha256(data).hexdigest()
+        if source == "md" and not await asyncio.to_thread(self._is_utf8_text, path):
+            raise AppError("INVALID_MARKDOWN", "Markdown 文件必须使用 UTF-8 编码", 422)
         async with self._admission:
             existing = await self.repository.by_hash(digest)
             if existing:
@@ -107,9 +127,9 @@ class KnowledgeService:
             }
             # Upload precedes metadata; failed uploads never create a false accepted record.
             await asyncio.to_thread(
-                self.objects.put,
+                self.objects.put_file,
                 key,
-                data,
+                path,
                 "application/pdf" if source == "pdf" else "text/markdown; charset=utf-8",
             )
             try:
@@ -128,10 +148,29 @@ class KnowledgeService:
             logger.info(
                 "document upload accepted document_id=%s bytes=%s task_id=%s",
                 identifier,
-                len(data),
+                size,
                 task.id,
             )
             return {"document": document_view(row), "duplicate": False, "taskId": task.id}
+
+    @staticmethod
+    def _looks_like_pdf(path: Path) -> bool:
+        """只读文件头判断真实格式，不把整份 PDF 载入内存。"""
+        with path.open("rb") as handle:
+            return handle.read(8192).lstrip().startswith(b"%PDF-")
+
+    @staticmethod
+    def _is_utf8_text(path: Path) -> bool:
+        """分块增量解码，避免为了校验编码而整块读取 Markdown。"""
+        decoder = codecs.getincrementaldecoder("utf-8-sig")()
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    decoder.decode(chunk)
+                decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            return False
+        return True
 
     async def retry(self, document_id):
         async with self._admission:
@@ -149,13 +188,22 @@ class KnowledgeService:
             logger.info("document retry accepted document_id=%s task_id=%s", document_id, task.id)
             return {"document": document_view(row), "duplicate": False, "taskId": task.id}
 
-    async def process_document(self, document_id, progress=None):
-        """Run one job; optional progress callback updates its in-memory task record."""
+    async def process_document(self, document_id, on_stage=None):
+        """Run one job; the optional callback receives every real (stage, detail).
 
-        def report(stage):
-            if progress is not None:
-                progress(stage)
-            logger.debug("document stage document_id=%s stage=%s", document_id, stage)
+        Only identifiers from `KNOWLEDGE_STAGES` are reported, so a client renders
+        its stepper without parsing Chinese prose. `queued` and `done` describe the
+        task lifecycle and are owned by the caller, not by this coroutine.
+        """
+
+        def report(stage, detail=None):
+            if not known_stage(stage, KNOWLEDGE_STAGES):
+                raise ValueError(f"unknown knowledge stage reported: {stage}")
+            if on_stage is not None:
+                on_stage(stage, detail)
+            logger.debug(
+                "document stage document_id=%s stage=%s detail=%s", document_id, stage, detail
+            )
 
         row = await self._require(document_id)
         if row["status"] != "processing":
@@ -168,37 +216,40 @@ class KnowledgeService:
             ):
                 raise AppError("MINERU_UNAVAILABLE", "PDF 解析服务未配置，暂时无法处理 PDF", 503)
             # Idempotent retry cleanup: failed/partial records are never used for RAG.
-            report("清理未完成的索引")
+            logger.debug("document cleanup before ingest document_id=%s", document_id)
             await asyncio.to_thread(self.vectors.delete, document_id)
             await self.repository.replace_chunks(document_id, [])
-            data = await asyncio.to_thread(self.objects.get, row["originalObjectKey"])
-            if row["sourceType"] == "md":
-                report("读取 Markdown 原文")
-                blocks = await asyncio.to_thread(markdown_blocks, data.decode("utf-8-sig"))
+            if row["sourceType"] == "pdf" and row.get("parserOutputPrefix"):
+                report("parse", "复用已保存的解析产物")
+                blocks = await self._saved_pdf_blocks(row["parserOutputPrefix"])
+            elif row["sourceType"] == "md":
+                # 原生 Markdown 没有外部解析步骤，直接进入切分。
+                with tempfile.TemporaryDirectory(prefix="medical-ingest-") as workdir:
+                    local = Path(workdir) / Path(row["fileName"]).name
+                    await asyncio.to_thread(
+                        self.objects.download_to, row["originalObjectKey"], local
+                    )
+                    text = await asyncio.to_thread(local.read_text, encoding="utf-8-sig")
+                blocks = await asyncio.to_thread(markdown_blocks, text)
             else:
-                if row.get("parserOutputPrefix"):
-                    report("复用已保存的 MinerU 解析产物")
-                    blocks = await self._saved_pdf_blocks(row["parserOutputPrefix"])
-                else:
-                    report("MinerU 解析 PDF")
-                    # Keep temp input alive until the synchronous parser thread terminates.
-                    result = await self._parse_pdf(data, row["fileName"])
-                    if result.content_list_v2_path is None:
-                        raise AppError(
-                            "PARSER_OUTPUT_MISSING", "MinerU 缺少唯一的 content_list_v2 产物", 422
-                        )
-                    prefix = f"knowledge/{document_id}/parser-output/"
-                    report("保存解析产物")
-                    await asyncio.to_thread(self.objects.upload_tree, result.output_dir, prefix)
-                    await self.repository.update(document_id, parserOutputPrefix=prefix)
-                    blocks = await asyncio.to_thread(mineru_blocks, result.content_list_v2_path)
+                report("parse", "MinerU 解析 PDF")
+                result = await self._parse_pdf(row)
+                if result.content_list_v2_path is None:
+                    raise AppError(
+                        "PARSER_OUTPUT_MISSING", "MinerU 缺少唯一的 content_list_v2 产物", 422
+                    )
+                prefix = f"knowledge/{document_id}/parser-output/"
+                report("parse", "保存解析产物")
+                await asyncio.to_thread(self.objects.upload_tree, result.output_dir, prefix)
+                await self.repository.update(document_id, parserOutputPrefix=prefix)
+                blocks = await asyncio.to_thread(mineru_blocks, result.content_list_v2_path)
             splitter = DocumentSplitter(
                 self.embedding.count_tokens,
                 self.settings.chunk_target_tokens,
                 self.settings.chunk_max_tokens,
                 self.settings.chunk_overlap_tokens,
             )
-            report("按标题与 token 切分")
+            report("split")
             chunks = await asyncio.to_thread(splitter.split, blocks)
             if not chunks:
                 raise AppError("DOCUMENT_EMPTY", "文档没有可用于检索的文字内容", 422)
@@ -210,7 +261,9 @@ class KnowledgeService:
             await self.repository.replace_chunks(document_id, chunks)
             # Bound inference batch memory, and only mark ready after every vector succeeds.
             for start in range(0, len(chunks), 8):
-                report(f"向量入库 {start}/{len(chunks)}")
+                done = min(start + 8, len(chunks))
+                # 阶段内的实际计数，不是百分比或时间估算。
+                report("vectorize", f"{done}/{len(chunks)}")
                 batch = chunks[start : start + 8]
                 encodings = await asyncio.to_thread(
                     self.embedding.encode,
@@ -230,7 +283,6 @@ class KnowledgeService:
                     len(chunks),
                 )
             await self.repository.update(document_id, status="ready")
-            report("入库完成")
             logger.info("document ready document_id=%s chunks=%s", document_id, len(chunks))
             return {"documentId": document_id, "chunkCount": len(chunks)}
         except BaseException as exc:
@@ -247,14 +299,25 @@ class KnowledgeService:
                 "DOCUMENT_PROCESSING_FAILED", "文档处理失败，请检查依赖后重新提交", 503
             ) from exc
 
-    async def _parse_pdf(self, data, file_name):
-        """Thread owns its input lifetime even if its awaiting task is cancelled."""
+    async def _parse_pdf(self, row):
+        """下载原件后由解析线程自己管理临时目录。
+
+        取消协程不会终止已经启动的线程：若用 with 管理临时目录，取消瞬间就会
+        删掉解析线程正在读的 PDF。所以清理责任交给线程，协程只负责下载。
+        """
+        workdir = Path(tempfile.mkdtemp(prefix="medical-ingest-"))
+        local = workdir / Path(row["fileName"]).name
+        try:
+            await asyncio.to_thread(self.objects.download_to, row["originalObjectKey"], local)
+        except BaseException:
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise
 
         def parse():
-            with tempfile.TemporaryDirectory(prefix="medical-knowledge-") as directory:
-                path = Path(directory) / file_name
-                path.write_bytes(data)
-                return self.mineru.parse(path)
+            try:
+                return self.mineru.parse(local)
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
 
         return await asyncio.to_thread(parse)
 

@@ -7,7 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from starlette.background import BackgroundTask
 from starlette.responses import StreamingResponse
 
-from app.modules.consultation.schema import ConversationInput, MessageInput
+from app.modules.consultation.schema import ConversationInput, MessageInput, TitleInput
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -25,6 +25,16 @@ async def list_conversations(request: Request, patientId: str | None = None):
 @router.get("/{conversation_id}")
 async def get_conversation(conversation_id: str, request: Request):
     return await request.app.state.services.consultation.get(conversation_id)
+
+
+@router.patch("/{conversation_id}/title")
+async def rename_conversation(conversation_id: str, data: TitleInput, request: Request):
+    return await request.app.state.services.consultation.rename(conversation_id, data.title)
+
+
+@router.delete("/{conversation_id}")
+async def delete_conversation(conversation_id: str, request: Request):
+    return await request.app.state.services.consultation.delete(conversation_id)
 
 
 @router.get("/{conversation_id}/messages")

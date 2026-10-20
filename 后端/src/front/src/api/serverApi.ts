@@ -1,13 +1,30 @@
-import type { StreamEvent } from './types'
+import type { Conversation, StreamEvent } from './types'
 
 const baseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 export const apiUrl = (path: string) => `${baseUrl}${path}`
+
+/** 携带 HTTP 状态与业务码，调用方才能区分“任务不存在”和“网络暂时异常”。 */
+export class ApiError extends Error {
+  status: number
+  code?: string
+
+  constructor(message: string, status: number, code?: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+  }
+}
 
 /** Only display deliberately public error messages, never arbitrary response bodies. */
 async function rejectResponse(response: Response): Promise<never> {
   const body = await response.json().catch(() => null)
   const error = body?.error
-  throw new Error(`${error?.message ?? `请求失败 (${response.status})`}${error?.requestId ? ` · 请求 ${error.requestId}` : ''}`)
+  throw new ApiError(
+    `${error?.message ?? `请求失败 (${response.status})`}${error?.requestId ? ` · 请求 ${error.requestId}` : ''}`,
+    response.status,
+    error?.code,
+  )
 }
 
 export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -20,6 +37,17 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
 }
 
 export const jsonBody = (value: unknown, method = 'POST'): RequestInit => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) })
+
+/** 手工改名：成功后该会话的 titleSource 变为 user，自动标题不再覆盖。 */
+export const renameConversation = (id: string, title: string) =>
+  requestJson<Conversation>(`/api/conversations/${encodeURIComponent(id)}/title`, jsonBody({ title }, 'PATCH'))
+
+/** 硬删除：会话与其全部消息一并移除，不可恢复。 */
+export const deleteConversation = (id: string) =>
+  requestJson<{ deleted: boolean; conversationId: string; messagesDeleted: number }>(
+    `/api/conversations/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  )
 
 /** Decode SSE across arbitrary UTF-8 and network chunk boundaries. */
 export async function streamMessage(conversationId: string, content: string, receive: (event: StreamEvent) => void, signal: AbortSignal): Promise<void> {

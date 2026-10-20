@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     chunk_max_tokens: int = env_field(800, "CHUNK_MAX_TOKENS", ge=40)
     chunk_overlap_tokens: int = env_field(80, "CHUNK_OVERLAP_TOKENS", ge=0)
     embedding_max_tokens: int = env_field(1024, "EMBEDDING_MAX_TOKENS", ge=800, le=8192)
-    upload_max_bytes: int = env_field(20 * 1024 * 1024, "UPLOAD_MAX_BYTES", ge=1)
+    # 上传按分块落盘处理，上限不再受内存约束；与 MinerU 的 200MB 单文件限制持平。
+    upload_max_bytes: int = env_field(200 * 1024 * 1024, "UPLOAD_MAX_BYTES", ge=1)
     access_url_seconds: int = env_field(900, "ACCESS_URL_SECONDS", ge=30, le=3600)
     rag_top_k: int = env_field(6, "RAG_TOP_K", ge=1, le=30)
     rag_history_messages: int = env_field(12, "RAG_HISTORY_MESSAGES", ge=0)
@@ -70,6 +71,9 @@ class Settings(BaseSettings):
     generation_max_tokens: int = env_field(1600, "GENERATION_MAX_TOKENS", ge=100)
     generation_timeout_seconds: float = env_field(180, "GENERATION_TIMEOUT_SECONDS", gt=0)
     max_message_chars: int = env_field(8000, "MAX_MESSAGE_CHARS", ge=1)
+    # 标题只生成一次；超时后回退首句截取，绝不阻塞回答。
+    title_max_chars: int = env_field(24, "TITLE_MAX_CHARS", ge=4, le=60)
+    title_timeout_seconds: float = env_field(6, "TITLE_TIMEOUT_SECONDS", gt=0, le=30)
     rag_query_tokens: int = env_field(1024, "RAG_QUERY_TOKENS", ge=10)
 
     @field_validator("mineru_output_dir", mode="before")

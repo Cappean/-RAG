@@ -45,6 +45,23 @@ class MemoryRepository:
     async def touch(self, identifier, now):
         self.conversations[identifier]["updatedAt"] = now
 
+    async def update_title(self, identifier, title, source):
+        if identifier not in self.conversations:
+            return False
+        self.conversations[identifier].update(title=title, titleSource=source)
+        return True
+
+    async def delete(self, identifier):
+        if identifier not in self.conversations:
+            return 0
+        del self.conversations[identifier]
+        doomed = [
+            key for key, item in self.messages.items() if item["conversationId"] == identifier
+        ]
+        for key in doomed:
+            del self.messages[key]
+        return len(doomed)
+
     async def recover(self, now):
         count = 0
         for item in self.messages.values():
@@ -60,13 +77,23 @@ class Patients:
 
 
 class Rag:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, title="胃癌术后辅助化疗"):
         self.fail = fail
+        self.title = title
         self.histories = []
 
-    async def prepare(self, question, history, patient):
+    async def suggest_title(self, question):
+        # None 用来模拟标题模型不可用，验证回退路径。
+        if self.title is None:
+            raise RuntimeError("isolated title model outage")
+        return self.title
+
+    async def prepare_steps(self, question, history, patient):
         self.histories.append(deepcopy(history))
-        return {
+        # Mirrors the real read path: every marker precedes the work it names.
+        for stage in ("intake", "retrieval", "citation"):
+            yield "stage", stage
+        yield "prepared", {
             "citations": [{"chunkId": "real-shape-only-test", "quote": "测试原文"}],
             "retrievalMs": 1,
         }
@@ -201,3 +228,85 @@ async def test_stream_persistence_failure_is_explicit_terminal_error():
     assert events[-1][1]["code"] == "MESSAGE_PERSISTENCE_FAILED"
     assert all(event[0] != "done" for event in events)
     assert not service.active
+
+
+async def test_stage_events_report_real_step_order_before_work():
+    """The page renders a stepper from these markers, so order is the contract."""
+    service, repo, identifier = await make_service()
+    turn = await service.begin(identifier, "阶段顺序测试")
+    events = [event async for event in turn.events()]
+    stages = [payload["stage"] for name, payload in events if name == "status"]
+    assert stages == ["intake", "retrieval", "citation", "generation", "done"]
+    assert events[0][0] == "assistant_created"
+    # Citations must arrive before the generation step starts, never after tokens.
+    names = [name for name, _ in events]
+    generation_at = next(
+        index
+        for index, (name, payload) in enumerate(events)
+        if name == "status" and payload.get("stage") == "generation"
+    )
+    assert names.index("citations") < generation_at
+    assert events[-1][0] == "done"
+
+
+async def test_stage_events_stop_at_failure_and_never_claim_done():
+    service, repo, identifier = await make_service(Rag(fail=True))
+    turn = await service.begin(identifier, "阶段失败测试")
+    events = [event async for event in turn.events()]
+    stages = [payload["stage"] for name, payload in events if name == "status"]
+    assert stages == ["intake", "retrieval", "citation", "generation"]
+    assert "done" not in stages
+    assert events[-1][0] == "error"
+    assert events[-1][1]["messageId"]
+    assert all(event[0] != "done" for event in events)
+
+
+async def test_first_turn_titles_once_and_user_rename_wins():
+    """标题只在默认状态下自动生成一次；用户改名后永不被覆盖。"""
+    service, repo, identifier = await make_service(Rag(title="胃癌术后辅助化疗"))
+    [event async for event in (await service.begin(identifier, "术后需要化疗吗？")).events()]
+    record = repo.conversations[ObjectId(identifier)]
+    assert record["title"] == "胃癌术后辅助化疗"
+    assert record["titleSource"] == "auto"
+
+    await service.rename(identifier, "我自己起的名字")
+    renamed = repo.conversations[ObjectId(identifier)]
+    assert renamed["titleSource"] == "user"
+    [event async for event in (await service.begin(identifier, "再问一轮")).events()]
+    assert repo.conversations[ObjectId(identifier)]["title"] == "我自己起的名字"
+
+
+async def test_title_falls_back_to_first_sentence_when_model_unavailable():
+    service, repo, identifier = await make_service(Rag(title=None))
+    question = "第二个周期化疗何时开始？后面还有安排"
+    [event async for event in (await service.begin(identifier, question)).events()]
+    record = repo.conversations[ObjectId(identifier)]
+    assert record["title"].startswith("第二个周期化疗何时开始")
+    assert record["titleSource"] == "auto"
+    # 回退不得把问句原文整段塞进标题。
+    assert len(record["title"]) <= 24
+
+
+async def test_delete_rejects_active_turn_then_removes_messages():
+    service, repo, identifier = await make_service()
+    turn = await service.begin(identifier, "删除冲突测试")
+    with pytest.raises(AppError) as caught:
+        await service.delete(identifier)
+    assert caught.value.code == "GENERATION_CONFLICT"
+    assert ObjectId(identifier) in repo.conversations
+    await turn.close()
+
+    result = await service.delete(identifier)
+    assert result["messagesDeleted"] == 2
+    assert ObjectId(identifier) not in repo.conversations
+    assert not repo.messages
+
+
+async def test_rename_rejects_blank_and_missing_conversation():
+    service, repo, identifier = await make_service()
+    with pytest.raises(AppError) as caught:
+        await service.rename(identifier, "   ")
+    assert caught.value.code == "TITLE_INVALID"
+    with pytest.raises(AppError) as missing:
+        await service.rename(str(ObjectId()), "任意标题")
+    assert missing.value.code == "CONVERSATION_NOT_FOUND"

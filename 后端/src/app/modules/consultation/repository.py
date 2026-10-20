@@ -38,6 +38,21 @@ class ConsultationRepository:
     async def touch(self, identifier, now):
         await self.conversations.update_one({"_id": identifier}, {"$set": {"updatedAt": now}})
 
+    async def update_title(self, identifier, title, source):
+        """改标题不触碰 updatedAt，避免重命名把会话顶到历史列表最前面。"""
+        result = await self.conversations.update_one(
+            {"_id": identifier}, {"$set": {"title": title, "titleSource": source}}
+        )
+        return result.matched_count > 0
+
+    async def delete(self, identifier):
+        """先删会话再删消息：会话不可见比遗留不可见消息更重要。"""
+        result = await self.conversations.delete_one({"_id": identifier})
+        if result.deleted_count == 0:
+            return 0
+        removed = await self.messages.delete_many({"conversationId": identifier})
+        return removed.deleted_count
+
     async def recover(self, now):
         result = await self.messages.update_many(
             {"role": "assistant", "status": "generating"},

@@ -52,6 +52,16 @@ class ObjectStore:
         )
         logger.debug("object stored bytes=%s", len(data))
 
+    def put_file(self, key: str, path: Path, content_type: str = "application/octet-stream"):
+        """按文件路径上传：大文件不必先整块读进内存再包装成 BytesIO。"""
+        self.client.fput_object(self.bucket, key, str(path), content_type=content_type)
+        logger.debug("object stored from file bytes=%s", path.stat().st_size)
+
+    def download_to(self, key: str, path: Path) -> None:
+        """流式下载到本地文件，供解析/切分按文件读取。"""
+        self.client.fget_object(self.bucket, key, str(path))
+        logger.debug("object downloaded to file bytes=%s", path.stat().st_size)
+
     def get(self, key: str) -> bytes:
         response = self.client.get_object(self.bucket, key)
         try:
@@ -322,6 +332,17 @@ class DeepSeekModel:
                 raise AppError("MODEL_STREAM_INTERRUPTED", "模型连接中断，回答未完整结束", 502)
         finally:
             await stream.close()
+
+    async def complete(self, messages, max_tokens: int = 64) -> str:
+        """非流式短文本（会话标题）；独立 token 预算，不占用回答额度。"""
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip()
 
     async def close(self):
         await self.client.close()

@@ -5,6 +5,7 @@ import json
 import re
 import time
 
+from app.common.titles import title_messages
 from app.core.errors import AppError
 from app.core.loggingUtils import get_logger
 
@@ -20,13 +21,26 @@ class RagService:
         self.settings = settings
 
     async def prepare(self, question: str, history: list[dict], patient: dict | None):
-        """Retrieve real dense+sparse evidence, then construct a bounded context.
+        """Compatibility wrapper: drain the step generator and return its payload."""
+        async for kind, value in self.prepare_steps(question, history, patient):
+            if kind == "prepared":
+                return value
+        # The generator always yields a payload; this guards future refactors.
+        raise AppError("RAG_PREPARE_INCOMPLETE", "检索流程没有产生可用结果", 503)
+
+    async def prepare_steps(self, question: str, history: list[dict], patient: dict | None):
+        """Yield real progress markers, then exactly one prepared payload.
+
+        Each marker is emitted *before* the work it names, so a client's active step
+        always matches what this coroutine is currently awaiting instead of a
+        fabricated timeline. Cancelling the consumer simply abandons the generator.
 
         The retrieval query includes the latest user turns to resolve references in
         follow-up questions. Only completed messages enter model history. API
         history remains complete; these limits apply solely to model context.
         """
         started = time.monotonic()
+        yield "stage", "intake"
         count = getattr(self.settings, "rag_history_messages", 12)
         completed = [item for item in history if item["status"] == "completed"]
         recent = completed[-count:] if count > 0 else []
@@ -34,6 +48,9 @@ class RagService:
         # Keep the current question first so tokenizer truncation cannot remove it
         # merely because prior user messages exhausted the embedding input budget.
         query = "\n".join([question, *prior_questions])
+        await asyncio.sleep(0)  # Let the caller forward intake before blocking on IO.
+
+        yield "stage", "retrieval"
         document_ids = await self.knowledge.ready_document_ids()
         evidence = []
         if document_ids:
@@ -51,6 +68,8 @@ class RagService:
             # Knowledge rechecks current readiness after vector retrieval: a stale
             # index entry cannot reintroduce a document disabled during the query.
             evidence = await self.knowledge.evidence(ids)
+
+        yield "stage", "citation"
         if not evidence and not getattr(self.settings, "allow_ungrounded_answers", False):
             raise AppError(
                 "NO_EVIDENCE",
@@ -111,7 +130,17 @@ class RagService:
             len(recent),
             elapsed,
         )
-        return {"messages": messages, "citations": citations, "retrievalMs": elapsed}
+        yield "prepared", {"messages": messages, "citations": citations, "retrievalMs": elapsed}
+
+    async def suggest_title(self, question: str) -> str:
+        """一次短调用概括首轮问题，仅用于历史列表标题。
+
+        提示词与规范化规则都在 `app.common.titles`，回填脚本用的是同一份，
+        不会出现线上标题与回填标题风格不一致。调用失败由上层回退，这里不吞异常。
+        """
+        title = await self.model.complete(title_messages(question), max_tokens=48)
+        logger.debug("title suggestion received chars=%s", len(title))
+        return title
 
     async def stream(self, prepared: dict):
         """Yield actual model deltas; upstream failures are never synthetic success."""
